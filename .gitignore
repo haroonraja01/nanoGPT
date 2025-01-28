@@ -10,3 +10,5 @@ __pycache__/
 input.txt
 env/
 venv/
+data/out-shakespeare-char
+data/out-shakespeare
