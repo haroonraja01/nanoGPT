@@ -41,6 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,14 +50,21 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, k_cache, v_cache): # Edit: kv
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x[:, -1, :].view(B, 1, C)).split(self.n_embd, dim=2)
+
+        # Adding new KV values to the KV cache
+        k_cache = torch.cat((k_cache, k), 1)
+        v_cache = torch.cat((v_cache, v), 1)
+
+        # B_new, T_new, C_new = self.k_cache[layer].size()
+        B_new, T_new, C_new = k_cache.size()
+
+        k = k_cache.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
+        v = v_cache.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -65,11 +73,12 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        y = y.transpose(1, 2).contiguous().view(B, 1, C) # re-assemble all head outputs side by side 
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -100,8 +109,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, k_cache, v_cache):
+        x = x + self.attn(self.ln_1(x), k_cache, v_cache) # Edit: kv
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -136,6 +145,10 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # initialize kv cache
+        self.k_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
+        self.v_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
 
         # init all weights
         self.apply(self._init_weights)
@@ -178,8 +191,9 @@ class GPT(nn.Module):
         # print(tok_emb.size)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, self.k_cache[i], self.v_cache[i])
         x = self.transformer.ln_f(x)
 
         if targets is not None:
