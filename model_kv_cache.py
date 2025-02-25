@@ -56,24 +56,38 @@ class CausalSelfAttention(nn.Module):
         q, k, v  = self.c_attn(x[:, -1, :].view(B, 1, C)).split(self.n_embd, dim=2)
 
         # Adding new KV values to the KV cache
-        k_cache = torch.cat((k_cache, k), 1)
-        v_cache = torch.cat((v_cache, v), 1)
+        # print(k_cache.size())
+        # k_cache = torch.cat((k_cache, k), 1)
+        # v_cache = torch.cat((v_cache, v), 1)
+        # print(k_cache.size(), k.size())
 
         # B_new, T_new, C_new = self.k_cache[layer].size()
-        B_new, T_new, C_new = k_cache.size()
+        # B_new, T_new, C_new = k_cache.size()
+        B_new, T_new, C_new = x.size()
+        # print(x.size())
+        T_new = 1
 
-        k = k_cache.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
-        v = v_cache.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B_new, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
+        v = v.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # print(k_cache.size())
+        k_cache = torch.cat((k_cache, k), 2)
+        v_cache = torch.cat((v_cache, v), 2)
+        # print(k_cache.size(), k.size(), v_cache.size())
+        k = k_cache
+        v = v_cache
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # print('attention')
+            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -82,7 +96,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, k_cache, v_cache
 
 class MLP(nn.Module):
 
@@ -110,9 +124,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, k_cache, v_cache):
-        x = x + self.attn(self.ln_1(x), k_cache, v_cache) # Edit: kv
+        att, k_cache, v_cache = self.attn(self.ln_1(x), k_cache, v_cache)
+        # x = x + self.attn(self.ln_1(x), k_cache, v_cache) # Edit: kv
+        x = x + att # Edit: kv
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, k_cache, v_cache
 
 @dataclass
 class GPTConfig:
@@ -193,7 +209,7 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
 
         for i, block in enumerate(self.transformer.h):
-            x = block(x, self.k_cache[i], self.v_cache[i])
+            x, self.k_cache[i], self.v_cache[i] = block(x, self.k_cache[i], self.v_cache[i]) # Edit: kv
         x = self.transformer.ln_f(x)
 
         if targets is not None:
