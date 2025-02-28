@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from tensordict import TensorDict
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -165,6 +167,19 @@ class GPT(nn.Module):
         # initialize kv cache
         self.k_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
         self.v_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
+        # self.k_cache = TensorDict(**self.k_cache, device=device)
+        # self.k_cache = TensorDict(**self.k_cache)
+
+        # self.k_cache = TensorDict([(k, torch.Tensor([])) for k in range(config.n_layer)])
+        # self.v_cache = TensorDict([(k, torch.Tensor([])) for k in range(config.n_layer)])
+
+        # Cannot make following approach work
+        # self.k_cache = TensorDict({"0" : torch.Tensor([])})
+        # self.v_cache = TensorDict({"0" : torch.Tensor([])})
+
+        # for k in range(1, config.n_layer):
+        #     self.k_cache[k] = torch.Tensor([])
+        #     self.v_cache[k] = torch.Tensor([])
 
         # init all weights
         self.apply(self._init_weights)
@@ -343,9 +358,6 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # print(idx_cond.size())
-            # print(idx_cond)
-            # exit()
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature

@@ -1,5 +1,28 @@
+# Implmenting kv cache in nanoGPT
 
-# nanoGPT
+Implemented kv caching and tested the implemetation for smaller `shakespeare` and `shakespeare-char` models. Model was trained as follows (for more details refer to Section [nanoGPT](#nanogpt)):
+```
+python train.py config/train_shakespeare_char.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
+```
+
+## Sampling/inference for `shakespeare-char` model
+
+Sampling using kv cache can be achieved by the following command:
+
+```
+python sample_kv_cache.py --out_dir=out-shakespeare-char --device=cpu --num_samples=1 --max_new_tokens=255
+```
+Similarly, the command for generation without kv caching is given below:
+```
+python sample.py --out_dir=out-shakespeare-char --device=cpu --num_samples=1 --max_new_tokens=255
+```
+Example generations resulting from these commands are given below:
+![kv_cache](assets/kv_cache_sample.png)
+![no_cache](assets/noncache_sample.png)
+
+We can observe that both approaches resulted in identical generations and the time elapsed for kv caching is `0.85sec` compared to `1.11sec` for generation without caching. Hence we can see that kv caching resulted in decrease in generation time while matching the output of non-caching approach for this small toy example.
+
+# <a name="nanoGPT"></a> nanoGPT
 
 ![nanoGPT](assets/nanogpt.jpg)
 
