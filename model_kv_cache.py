@@ -15,8 +15,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from tensordict import TensorDict
-
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -53,30 +51,24 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, k_cache, v_cache): # Edit: kv
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, _, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        '''
+        sequence length for kv cache implementation is always 1,
+        since previous (T-1) kv values have already been stored
+        in the kv-cache
+        '''
+        T = 1 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x[:, -1, :].view(B, 1, C)).split(self.n_embd, dim=2)
 
-        # Adding new KV values to the KV cache
-        # print(k_cache.size())
-        # k_cache = torch.cat((k_cache, k), 1)
-        # v_cache = torch.cat((v_cache, v), 1)
-        # print(k_cache.size(), k.size())
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # B_new, T_new, C_new = self.k_cache[layer].size()
-        # B_new, T_new, C_new = k_cache.size()
-        B_new, T_new, C_new = x.size()
-        # print(x.size())
-        T_new = 1
-
-        k = k.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B_new, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
-        v = v.view(B_new, T_new, self.n_head, C_new // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # print(k_cache.size())
+        # Expand chache, i.e., append new k and v values to the cache
         k_cache = torch.cat((k_cache, k), 2)
         v_cache = torch.cat((v_cache, v), 2)
-        # print(k_cache.size(), k.size(), v_cache.size())
         k = k_cache
         v = v_cache
 
@@ -84,12 +76,12 @@ class CausalSelfAttention(nn.Module):
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             # print('attention')
-            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Mask is not required for kv cache implementation
+            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -144,7 +136,7 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, k_cache, v_cache):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -164,23 +156,10 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # initialize kv cache
-        self.k_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
-        self.v_cache = dict([(k, torch.Tensor([])) for k in range(config.n_layer)])
-        # self.k_cache = TensorDict(**self.k_cache, device=device)
-        # self.k_cache = TensorDict(**self.k_cache)
-
-        # self.k_cache = TensorDict([(k, torch.Tensor([])) for k in range(config.n_layer)])
-        # self.v_cache = TensorDict([(k, torch.Tensor([])) for k in range(config.n_layer)])
-
-        # Cannot make following approach work
-        # self.k_cache = TensorDict({"0" : torch.Tensor([])})
-        # self.v_cache = TensorDict({"0" : torch.Tensor([])})
-
-        # for k in range(1, config.n_layer):
-        #     self.k_cache[k] = torch.Tensor([])
-        #     self.v_cache[k] = torch.Tensor([])
-
+        # initialize kv cache within the top-level object since it is required throughout the lifetime of this object
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper

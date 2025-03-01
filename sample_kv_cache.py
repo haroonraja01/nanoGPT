@@ -39,7 +39,16 @@ if init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
+    # Initialize kv cache
+    k_cache = dict([(k, torch.Tensor([])) for k in range(gptconf.n_layer)])
+    v_cache = dict([(k, torch.Tensor([])) for k in range(gptconf.n_layer)])
+    # move cache to the device where model resides
+    for key, tensor in k_cache.items():
+        k_cache[key] = tensor.to(device)
+    for key, tensor in v_cache.items():
+        v_cache[key] = tensor.to(device)
+    
+    model = GPT(gptconf, k_cache, v_cache)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
