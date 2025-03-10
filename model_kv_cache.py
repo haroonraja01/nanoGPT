@@ -41,6 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,32 +50,47 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x, k_cache, v_cache): # Edit: kv
+        B, _, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        '''
+        sequence length for kv cache implementation is always 1,
+        since previous (T-1) kv values have already been stored
+        in the kv-cache
+        '''
+        T = 1 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x[:, -1, :].view(B, 1, C)).split(self.n_embd, dim=2)
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T=1, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # print(k.size())
+
+        # Expand chache, i.e., append new k and v values to the cache
+        k_cache = torch.cat((k_cache, k), 2)
+        v_cache = torch.cat((v_cache, v), 2)
+        k = k_cache
+        v = v_cache
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # print('attention')
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Mask is not required for kv cache implementation
+            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        y = y.transpose(1, 2).contiguous().view(B, 1, C) # re-assemble all head outputs side by side 
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, k_cache, v_cache
 
 class MLP(nn.Module):
 
@@ -101,10 +117,12 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, k_cache, v_cache):
+        att, k_cache, v_cache = self.attn(self.ln_1(x), k_cache, v_cache)
+        # x = x + self.attn(self.ln_1(x), k_cache, v_cache) # Edit: kv
+        x = x + att # Edit: kv
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, k_cache, v_cache
 
 @dataclass
 class GPTConfig:
@@ -118,7 +136,7 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, k_cache, v_cache):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -138,6 +156,10 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        # initialize kv cache within the top-level object since it is required throughout the lifetime of this object
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -176,10 +198,12 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # print(tok_emb.size)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        for i, block in enumerate(self.transformer.h):
+            x, self.k_cache[i], self.v_cache[i] = block(x, self.k_cache[i], self.v_cache[i]) # Edit: kv
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -329,4 +353,3 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-    
